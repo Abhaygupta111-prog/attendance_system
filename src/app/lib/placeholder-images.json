@@ -1,0 +1,29 @@
+
+{
+  "placeholderImages": [
+    {
+      "id": "hero-dashboard",
+      "description": "Professional dashboard background",
+      "imageUrl": "https://picsum.photos/seed/dash1/1200/800",
+      "imageHint": "dashboard interface"
+    },
+    {
+      "id": "avatar-admin",
+      "description": "Admin user avatar",
+      "imageUrl": "https://picsum.photos/seed/admin/200/200",
+      "imageHint": "professional man"
+    },
+    {
+      "id": "avatar-teacher",
+      "description": "Teacher user avatar",
+      "imageUrl": "https://picsum.photos/seed/teacher/200/200",
+      "imageHint": "professional woman"
+    },
+    {
+      "id": "avatar-student",
+      "description": "Student user avatar",
+      "imageUrl": "https://picsum.photos/seed/student/200/200",
+      "imageHint": "young student"
+    }
+  ]
+}

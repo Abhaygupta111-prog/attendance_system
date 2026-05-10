@@ -1,107 +1,92 @@
 /**
- * Liveness Detection — Anti-Spoofing
- * 
- * Photo mein aankhein KABHI nahi jhapakti.
- * Real face mein EAR (Eye Aspect Ratio) vary karta hai.
- * Agar EAR bahut high hai (aankhein fully open & static) = PHOTO
- * Agar EAR low hai (blink detected) = REAL FACE
- * 
- * Hum multiple frames mein EAR track karte hain.
- * Agar EAR vary karta hai = real, nahi karta = photo.
+ * Liveness Detection — Strict 3-Blink Counter
+ *
+ * RULE:
+ *  - Person MUST blink 3 times within MAX_FRAMES (~4 sec at 30fps)
+ *  - 3 blinks = REAL ✅
+ *  - Less than 3 blinks when time runs out = PROXY 🚫
+ *
+ * HOW BLINK IS DETECTED:
+ *  - EAR (Eye Aspect Ratio) < EAR_CLOSE_THRESHOLD → eye closing
+ *  - EAR > EAR_OPEN_THRESHOLD after closing → eye opened = 1 blink
  */
 
-/** Euclidean distance between two 2D points */
-function dist(
-  p1: { x: number; y: number },
-  p2: { x: number; y: number }
-): number {
+function dist(p1: { x: number; y: number }, p2: { x: number; y: number }): number {
   return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
 }
 
 /**
- * Eye Aspect Ratio (EAR) — dono aankhon ka average
- * face-api landmark indices for 68-point model:
- *   Left eye:  36-41
- *   Right eye: 42-47
+ * Eye Aspect Ratio (EAR) using face-api 68-point landmarks
+ * Left eye : 36-41
+ * Right eye: 42-47
+ * Open eye EAR  ≈ 0.25–0.32
+ * Closed eye EAR ≈ 0.10–0.18
  */
 export function computeEAR(landmarks: { x: number; y: number }[]): number {
-  // Left eye points
-  const lP1 = landmarks[36];
-  const lP2 = landmarks[37];
-  const lP3 = landmarks[38];
-  const lP4 = landmarks[39];
-  const lP5 = landmarks[40];
-  const lP6 = landmarks[41];
+  const lP1 = landmarks[36], lP2 = landmarks[37], lP3 = landmarks[38];
+  const lP4 = landmarks[39], lP5 = landmarks[40], lP6 = landmarks[41];
+  const rP1 = landmarks[42], rP2 = landmarks[43], rP3 = landmarks[44];
+  const rP4 = landmarks[45], rP5 = landmarks[46], rP6 = landmarks[47];
 
-  // Right eye points
-  const rP1 = landmarks[42];
-  const rP2 = landmarks[43];
-  const rP3 = landmarks[44];
-  const rP4 = landmarks[45];
-  const rP5 = landmarks[46];
-  const rP6 = landmarks[47];
-
-  // EAR formula: (vertical1 + vertical2) / (2 * horizontal)
-  const leftEAR =
-    (dist(lP2, lP6) + dist(lP3, lP5)) / (2.0 * dist(lP1, lP4));
-  const rightEAR =
-    (dist(rP2, rP6) + dist(rP3, rP5)) / (2.0 * dist(rP1, rP4));
-
+  const leftEAR  = (dist(lP2, lP6) + dist(lP3, lP5)) / (2.0 * dist(lP1, lP4));
+  const rightEAR = (dist(rP2, rP6) + dist(rP3, rP5)) / (2.0 * dist(rP1, rP4));
   return (leftEAR + rightEAR) / 2.0;
 }
 
-/**
- * LivenessChecker class — multiple frames track karta hai
- * Usage:
- *   const checker = new LivenessChecker()
- *   // har frame mein:
- *   checker.addFrame(landmarks)
- *   const result = checker.getResult()
- */
 export class LivenessChecker {
-  private earHistory: number[] = [];
-  private readonly requiredFrames = 15;   // kitne frames collect karne hain
-  private readonly varianceThreshold = 0.0003; // variance itna hona chahiye = real face
+  private readonly EAR_CLOSE_THRESHOLD = 0.20; // below = eye closing
+  private readonly EAR_OPEN_THRESHOLD  = 0.24; // above after close = blink complete
+  private readonly REQUIRED_BLINKS     = 3;    // must blink 3 times
+  private readonly MAX_FRAMES          = 150;  // ~5 sec at 30fps
 
-  /** Ek frame ka EAR add karo */
+  private blinkCount   = 0;
+  private eyeWasClosed = false;
+  private frameCount   = 0;
+  private _result: 'real' | 'photo' | 'pending' = 'pending';
+
   addFrame(landmarks: { x: number; y: number }[]): void {
     if (landmarks.length < 68) return;
+    if (this._result !== 'pending') return;
+
+    this.frameCount++;
     const ear = computeEAR(landmarks);
-    this.earHistory.push(ear);
-    // sirf last 30 frames rakh
-    if (this.earHistory.length > 30) this.earHistory.shift();
+
+    // State machine: detect close → open transition = one blink
+    if (!this.eyeWasClosed && ear < this.EAR_CLOSE_THRESHOLD) {
+      this.eyeWasClosed = true;
+    } else if (this.eyeWasClosed && ear > this.EAR_OPEN_THRESHOLD) {
+      this.blinkCount++;
+      this.eyeWasClosed = false;
+      console.log(`[Liveness] Blink #${this.blinkCount} | EAR: ${ear.toFixed(3)}`);
+    }
+
+    if (this.blinkCount >= this.REQUIRED_BLINKS) {
+      this._result = 'real';
+      console.log('[Liveness] ✅ REAL — 3 blinks confirmed');
+    } else if (this.frameCount >= this.MAX_FRAMES) {
+      this._result = 'photo';
+      console.log(`[Liveness] 🚫 PROXY — only ${this.blinkCount}/3 blinks in ${this.frameCount} frames`);
+    }
   }
 
-  /** Enough frames collect hue? */
-  isReady(): boolean {
-    return this.earHistory.length >= this.requiredFrames;
-  }
+  isReady(): boolean   { return this._result !== 'pending'; }
+  getBlinkCount(): number { return this.blinkCount; }
+  getFrameCount(): number { return this.frameCount; }
+  getMaxFrames(): number  { return this.MAX_FRAMES; }
 
-  /** Progress 0-100 */
+  /** 0-100 progress: driven by blinks first, time as fallback */
   getProgress(): number {
-    return Math.min(100, Math.round((this.earHistory.length / this.requiredFrames) * 100));
+    const byBlinks = (this.blinkCount / this.REQUIRED_BLINKS) * 100;
+    const byTime   = (this.frameCount  / this.MAX_FRAMES)     * 100;
+    return Math.min(100, Math.max(byBlinks, byTime * 0.4));
   }
 
-  /**
-   * Result check karo
-   * returns: 'real' | 'photo' | 'pending'
-   */
-  getResult(): 'real' | 'photo' | 'pending' {
-    if (!this.isReady()) return 'pending';
-
-    const mean = this.earHistory.reduce((a, b) => a + b, 0) / this.earHistory.length;
-    const variance =
-      this.earHistory.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) /
-      this.earHistory.length;
-
-    console.log(`[Liveness] EAR variance: ${variance.toFixed(6)} (threshold: ${this.varianceThreshold})`);
-
-    // Photo mein variance almost 0 hota hai
-    // Real face mein variance higher hota hai (subtle movements)
-    return variance >= this.varianceThreshold ? 'real' : 'photo';
-  }
+  getResult(): 'real' | 'photo' | 'pending' { return this._result; }
 
   reset(): void {
-    this.earHistory = [];
+    this.blinkCount   = 0;
+    this.eyeWasClosed = false;
+    this.frameCount   = 0;
+    this._result      = 'pending';
   }
 }

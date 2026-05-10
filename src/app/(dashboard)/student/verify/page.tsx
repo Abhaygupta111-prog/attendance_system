@@ -131,7 +131,6 @@ export default function StudentVerifyAttendance() {
         cancelAnimationFrame(animFrameRef.current);
 
         if (livenessResult === 'photo') {
-            // Try to identify whose photo it is
             setVerifyStep('face');
             const video = videoRef.current;
             if (video) {
@@ -368,5 +367,3 @@ export default function StudentVerifyAttendance() {
         </div>
     );
 }
-ENDOFFILE
-echo "Done!"

@@ -7,18 +7,19 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Button } from '@/components/ui/button';
 import {
     CheckCircle2, Loader2, ArrowLeft, ShieldCheck,
-    MapPin, AlertTriangle, Camera, Brain, XCircle, UserX, Eye, Bell
+    MapPin, AlertTriangle, Camera, Brain, XCircle, UserX, Eye,
+    Smile, MoveHorizontal, MoveVertical, Bell
 } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 import { authService, dataStore } from '@/lib/store';
-import { LivenessChecker } from '@/lib/livenessDetection';
+import { LivenessChecker, LiveSignal } from '@/lib/livenessDetection';
 
 type VerifyStep = 'idle' | 'liveness' | 'models' | 'face' | 'location' | 'saving' | 'done';
 type LivenessState = 'pending' | 'real' | 'photo';
 
 const STEP_LABELS: Record<VerifyStep, string> = {
     idle: '',
-    liveness: 'Blink 3 times to prove you are real...',
+    liveness: 'Prove you are real...',
     models: 'Loading AI models...',
     face: 'Matching your face...',
     location: 'Getting GPS location...',
@@ -26,31 +27,38 @@ const STEP_LABELS: Record<VerifyStep, string> = {
     done: '',
 };
 
-// ─── Browser Push Notification helper ───────────────────────────────────────
-async function sendNotification(title: string, body: string, icon = '/favicon.ico') {
+// Signal display config
+const SIGNAL_CONFIG: Record<LiveSignal, { label: string; icon: React.ReactNode }> = {
+    blink: { label: 'Blink',      icon: <Eye size={18} /> },
+    smile: { label: 'Smile',      icon: <Smile size={18} /> },
+    turn:  { label: 'Turn Head',  icon: <MoveHorizontal size={18} /> },
+    nod:   { label: 'Nod Head',   icon: <MoveVertical size={18} /> },
+};
+
+async function sendNotification(title: string, body: string) {
     if (!('Notification' in window)) return;
-    if (Notification.permission === 'default') {
-        await Notification.requestPermission();
-    }
-    if (Notification.permission === 'granted') {
-        new Notification(title, { body, icon });
-    }
+    if (Notification.permission === 'default') await Notification.requestPermission();
+    if (Notification.permission === 'granted') new Notification(title, { body, icon: '/favicon.ico' });
 }
 
 export default function StudentVerifyAttendance() {
-    const [verifyStep, setVerifyStep]         = useState<VerifyStep>('idle');
-    const [isVerified, setIsVerified]         = useState(false);
-    const [livenessState, setLivenessState]   = useState<LivenessState>('pending');
-    const [livenessProgress, setLivenessProgress] = useState(0);
-    const [blinkCount, setBlinkCount]         = useState(0);
-    const [notifGranted, setNotifGranted]     = useState(false);
-    const [proxyStudent, setProxyStudent]     = useState<null | {
+    const [verifyStep, setVerifyStep]       = useState<VerifyStep>('idle');
+    const [isVerified, setIsVerified]       = useState(false);
+    const [livenessState, setLivenessState] = useState<LivenessState>('pending');
+    const [signals, setSignals]             = useState<Set<LiveSignal>>(new Set());
+    const [instruction, setInstruction]     = useState('Blink, smile, or move your head');
+    const [progress, setProgress]           = useState(0);
+    const [timeLeft, setTimeLeft]           = useState(7);
+    const [notifGranted, setNotifGranted]   = useState(false);
+    const [faceDetected, setFaceDetected]   = useState(false);
+    const [proxyStudent, setProxyStudent]   = useState<null | {
         name: string; rollNo: string; email: string; photoURL?: string; class?: string;
     }>(null);
 
-    const videoRef      = useRef<HTMLVideoElement>(null);
-    const animFrameRef  = useRef<number>(0);
-    const checkerRef    = useRef<LivenessChecker>(new LivenessChecker());
+    const videoRef     = useRef<HTMLVideoElement>(null);
+    const canvasRef    = useRef<HTMLCanvasElement>(null);
+    const animFrameRef = useRef<number>(0);
+    const checkerRef   = useRef<LivenessChecker>(new LivenessChecker());
 
     const router       = useRouter();
     const searchParams = useSearchParams();
@@ -58,10 +66,10 @@ export default function StudentVerifyAttendance() {
     const { toast }    = useToast();
     const user         = authService.getCurrentUser();
 
-    // ── Camera init ────────────────────────────────────────────────────────
+    // Camera init
     useEffect(() => {
         navigator.mediaDevices
-            .getUserMedia({ video: { facingMode: 'user' } })
+            .getUserMedia({ video: { facingMode: 'user', width: 640, height: 480 } })
             .then(stream => { if (videoRef.current) videoRef.current.srcObject = stream; })
             .catch(() => toast({ variant: 'destructive', title: 'Camera Error', description: 'Enable camera to verify attendance.' }));
         return () => {
@@ -72,60 +80,114 @@ export default function StudentVerifyAttendance() {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    // ── Ask for notification permission on mount ───────────────────────────
+    // Notification permission
     useEffect(() => {
         if ('Notification' in window) {
-            if (Notification.permission === 'granted') {
-                setNotifGranted(true);
-            } else if (Notification.permission === 'default') {
-                Notification.requestPermission().then(p => setNotifGranted(p === 'granted'));
-            }
+            if (Notification.permission === 'granted') setNotifGranted(true);
+            else Notification.requestPermission().then(p => setNotifGranted(p === 'granted'));
         }
     }, []);
 
-    // ── Liveness loop ──────────────────────────────────────────────────────
+    // Liveness loop — auto detects face, no manual trigger needed for detection
     const startLivenessLoop = useCallback(async (faceapi: typeof import('@vladmandic/face-api')) => {
         const checker = checkerRef.current;
         checker.reset();
+
         const loop = async () => {
             if (!videoRef.current) return;
-            const result = await faceapi
-                .detectSingleFace(videoRef.current, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.4 }))
+
+            const detection = await faceapi
+                .detectSingleFace(videoRef.current, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 }))
                 .withFaceLandmarks();
-            if (result) {
-                const pts = result.landmarks.positions.map((p: { x: number; y: number }) => ({ x: p.x, y: p.y }));
+
+            if (detection) {
+                setFaceDetected(true);
+                const pts = detection.landmarks.positions.map((p: { x: number; y: number }) => ({ x: p.x, y: p.y }));
                 checker.addFrame(pts);
-                setLivenessProgress(checker.getProgress());
-                setBlinkCount(checker.getBlinkCount());
+
+                // Draw face outline on canvas (no circle — auto outline)
+                if (canvasRef.current && videoRef.current) {
+                    const ctx = canvasRef.current.getContext('2d');
+                    if (ctx) {
+                        canvasRef.current.width  = videoRef.current.videoWidth  || 640;
+                        canvasRef.current.height = videoRef.current.videoHeight || 480;
+                        ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+
+                        const box = detection.detection.box;
+                        const status = checker.getStatus();
+
+                        // Box color by state
+                        const color = status.result === 'real'  ? '#22c55e' :
+                                      status.result === 'photo' ? '#ef4444' :
+                                      status.signals.size > 0  ? '#f59e0b' : '#6366f1';
+
+                        ctx.strokeStyle = color;
+                        ctx.lineWidth   = 3;
+                        ctx.shadowColor = color;
+                        ctx.shadowBlur  = 12;
+
+                        // Rounded rect around face
+                        const r = 12, x = box.x, y = box.y, w = box.width, h = box.height;
+                        ctx.beginPath();
+                        ctx.moveTo(x + r, y);
+                        ctx.lineTo(x + w - r, y);
+                        ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+                        ctx.lineTo(x + w, y + h - r);
+                        ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+                        ctx.lineTo(x + r, y + h);
+                        ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+                        ctx.lineTo(x, y + r);
+                        ctx.quadraticCurveTo(x, y, x + r, y);
+                        ctx.closePath();
+                        ctx.stroke();
+                    }
+                }
+
+                const status = checker.getStatus();
+                setSignals(new Set(status.signals));
+                setInstruction(status.instruction);
+                setProgress(status.progress);
+                setTimeLeft(status.timeLeft);
+
                 if (checker.isReady()) {
                     const res = checker.getResult();
                     setLivenessState(res === 'real' ? 'real' : 'photo');
                     cancelAnimationFrame(animFrameRef.current);
                     return;
                 }
+            } else {
+                setFaceDetected(false);
+                // Clear canvas when no face
+                if (canvasRef.current) {
+                    const ctx = canvasRef.current.getContext('2d');
+                    ctx?.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+                }
             }
+
             animFrameRef.current = requestAnimationFrame(loop);
         };
+
         animFrameRef.current = requestAnimationFrame(loop);
     }, []);
 
-    // ── Main verify handler ────────────────────────────────────────────────
     const handleVerify = async () => {
         if (!sessionId || !user) return;
         setProxyStudent(null);
         setLivenessState('pending');
-        setLivenessProgress(0);
-        setBlinkCount(0);
+        setSignals(new Set());
+        setProgress(0);
+        setTimeLeft(7);
+        setFaceDetected(false);
         checkerRef.current.reset();
 
-        // 1. Load user data
+        // Load models
         setVerifyStep('models');
         const users     = await dataStore.getUsers();
         const freshUser = users.find(u => u.id === user.id);
 
         if (!freshUser?.faceEnrolled || !freshUser?.faceDescriptor?.length) {
             toast({ variant: 'destructive', title: 'Face Not Enrolled', description: 'Please enroll your face first.' });
-            await sendNotification('⚠️ Face Not Enrolled', 'Go to settings and enroll your face before verifying attendance.');
+            await sendNotification('⚠️ Face Not Enrolled', 'Please enroll your face in settings first.');
             setVerifyStep('idle');
             return;
         }
@@ -136,44 +198,42 @@ export default function StudentVerifyAttendance() {
         let FACE_MATCH_THRESHOLD: number;
 
         try {
-            const faceApiLib = await import('@/lib/faceApi');
+            const faceApiLib       = await import('@/lib/faceApi');
             await faceApiLib.loadFaceModels();
-            faceapi              = await import('@vladmandic/face-api');
+            faceapi                = await import('@vladmandic/face-api');
             getDescriptorFromVideo = faceApiLib.getDescriptorFromVideo;
-            faceDistance         = faceApiLib.faceDistance;
-            FACE_MATCH_THRESHOLD = faceApiLib.FACE_MATCH_THRESHOLD;
+            faceDistance           = faceApiLib.faceDistance;
+            FACE_MATCH_THRESHOLD   = faceApiLib.FACE_MATCH_THRESHOLD;
         } catch {
             toast({ variant: 'destructive', title: 'Model Load Failed', description: 'Could not load face recognition AI.' });
             setVerifyStep('idle');
             return;
         }
 
-        // 2. Liveness check
+        // Start liveness — auto runs, no user action needed
         setVerifyStep('liveness');
-        await sendNotification('👁️ Liveness Check Started', 'Please blink 3 times naturally to prove you are real.');
+        await sendNotification('👁 Liveness Check', 'Blink, smile, or move your head to prove you are real.');
         startLivenessLoop(faceapi!);
 
         const livenessResult = await new Promise<'real' | 'photo'>((resolve) => {
-            const interval = setInterval(() => {
-                const result = checkerRef.current.getResult();
-                if (result !== 'pending') { clearInterval(interval); resolve(result); }
+            const iv = setInterval(() => {
+                const r = checkerRef.current.getResult();
+                if (r !== 'pending') { clearInterval(iv); resolve(r); }
             }, 100);
         });
 
         cancelAnimationFrame(animFrameRef.current);
 
         if (livenessResult === 'photo') {
-            // Try to identify the photo
             setVerifyStep('face');
             const video = videoRef.current;
             if (video) {
-                const suspectDescriptor = await getDescriptorFromVideo(video);
-                if (suspectDescriptor) {
-                    let bestMatch = null;
-                    let bestDist  = FACE_MATCH_THRESHOLD;
+                const suspectDesc = await getDescriptorFromVideo(video);
+                if (suspectDesc) {
+                    let bestMatch = null, bestDist = FACE_MATCH_THRESHOLD;
                     for (const u of users) {
                         if (!u.faceDescriptor?.length) continue;
-                        const d = faceDistance(suspectDescriptor, Float32Array.from(u.faceDescriptor));
+                        const d = faceDistance(suspectDesc, Float32Array.from(u.faceDescriptor));
                         if (d < bestDist) { bestDist = d; bestMatch = u; }
                     }
                     if (bestMatch) {
@@ -184,81 +244,56 @@ export default function StudentVerifyAttendance() {
                             photoURL: (bestMatch as Record<string, string>).photoURL,
                             class:    (bestMatch as Record<string, string>).class,
                         });
-                        await sendNotification(
-                            '🚫 Proxy Attempt Detected!',
-                            `${bestMatch.name ?? 'Someone'} tried to use a photo. Attendance NOT marked.`
-                        );
+                        await sendNotification('🚫 Proxy Detected!', `${bestMatch.name ?? 'Someone'} tried to use a photo.`);
                     } else {
-                        await sendNotification('🚫 Proxy Detected!', 'Unknown photo detected. Attendance NOT marked.');
+                        await sendNotification('🚫 Proxy Detected!', 'Unknown photo. Attendance NOT marked.');
                     }
                 }
             }
             setVerifyStep('idle');
-            toast({
-                variant: 'destructive',
-                title: '🚫 Proxy Detected!',
-                description: `Only ${checkerRef.current.getBlinkCount()}/3 blinks. Photo detected. Attendance NOT marked.`,
-            });
+            toast({ variant: 'destructive', title: '🚫 Proxy Detected!', description: 'No liveness signals detected. Attendance NOT marked.' });
             return;
         }
 
-        // 3. Face match
+        // Face match
         setVerifyStep('face');
-        await sendNotification('✅ Liveness Passed!', 'All 3 blinks detected. Now matching your face...');
+        await sendNotification('✅ Liveness Passed!', 'Now matching your face...');
         const video = videoRef.current;
-        if (!video) {
-            toast({ variant: 'destructive', title: 'Camera Error', description: 'Camera not accessible.' });
-            setVerifyStep('idle');
-            return;
-        }
+        if (!video) { toast({ variant: 'destructive', title: 'Camera Error', description: 'Camera not accessible.' }); setVerifyStep('idle'); return; }
 
-        const liveDescriptor = await getDescriptorFromVideo(video);
-        if (!liveDescriptor) {
+        const liveDesc = await getDescriptorFromVideo(video);
+        if (!liveDesc) {
             toast({ variant: 'destructive', title: 'No Face Detected', description: 'Ensure face is visible and well-lit.' });
             setVerifyStep('idle');
             return;
         }
 
-        const storedDescriptor = Float32Array.from(freshUser.faceDescriptor);
-        const distance         = faceDistance(liveDescriptor, storedDescriptor);
+        const stored   = Float32Array.from(freshUser.faceDescriptor);
+        const distance = faceDistance(liveDesc, stored);
 
         if (distance > FACE_MATCH_THRESHOLD) {
-            toast({ variant: 'destructive', title: 'Face Not Recognised', description: `Similarity too low (${((1 - distance) * 100).toFixed(0)}%).` });
-            await sendNotification('❌ Face Not Recognised', `Your face did not match. Score: ${((1 - distance) * 100).toFixed(0)}%`);
+            toast({ variant: 'destructive', title: 'Face Not Recognised', description: `Score: ${((1 - distance) * 100).toFixed(0)}%` });
+            await sendNotification('❌ Face Not Matched', `Score too low: ${((1 - distance) * 100).toFixed(0)}%`);
             setVerifyStep('idle');
             return;
         }
 
-        // 4. GPS
+        // GPS
         setVerifyStep('location');
-        if (!navigator.geolocation) {
-            toast({ variant: 'destructive', title: 'Location Error', description: 'Geolocation not supported.' });
-            setVerifyStep('idle');
-            return;
-        }
+        if (!navigator.geolocation) { toast({ variant: 'destructive', title: 'Location Error', description: 'Geolocation not supported.' }); setVerifyStep('idle'); return; }
 
         navigator.geolocation.getCurrentPosition(
-            async (position) => {
-                const { latitude, longitude } = position.coords;
+            async (pos) => {
+                const { latitude, longitude } = pos.coords;
                 setVerifyStep('saving');
-
                 const sessions = await dataStore.getLiveSessions();
                 const session  = sessions.find(s => s.id === sessionId && s.isActive);
-                if (!session) {
-                    toast({ variant: 'destructive', title: 'Session Ended', description: 'This session is no longer active.' });
-                    setVerifyStep('idle');
-                    return;
-                }
-
+                if (!session) { toast({ variant: 'destructive', title: 'Session Ended', description: 'This session is no longer active.' }); setVerifyStep('idle'); return; }
                 await dataStore.markAttendance([user.id], session.classId, { lat: latitude, lng: longitude });
                 setIsVerified(true);
                 setVerifyStep('done');
-
-                toast({ title: '✅ Attendance Marked!', description: `Face matched (${((1 - distance) * 100).toFixed(0)}% similarity) · GPS recorded.` });
-                await sendNotification(
-                    '✅ Attendance Marked!',
-                    `Your attendance has been recorded. Face match: ${((1 - distance) * 100).toFixed(0)}% · GPS logged.`
-                );
+                toast({ title: '✅ Attendance Marked!', description: `Face matched (${((1 - distance) * 100).toFixed(0)}%) · GPS recorded.` });
+                await sendNotification('✅ Attendance Marked!', `Welcome! Face: ${((1 - distance) * 100).toFixed(0)}% match · Location saved.`);
             },
             (err) => {
                 setVerifyStep('idle');
@@ -273,9 +308,8 @@ export default function StudentVerifyAttendance() {
     const isProcessing   = verifyStep !== 'idle' && verifyStep !== 'done';
     const steps: VerifyStep[] = ['liveness', 'models', 'face', 'location', 'saving'];
     const currentStepIdx = steps.indexOf(verifyStep);
-    const timeLeft       = Math.max(0, Math.round(((checkerRef.current.getMaxFrames() - checkerRef.current.getFrameCount()) / 30)));
+    const allSignals: LiveSignal[] = ['blink', 'smile', 'turn', 'nod'];
 
-    // ── Verified screen ────────────────────────────────────────────────────
     if (isVerified) {
         return (
             <div className="min-h-[80vh] flex items-center justify-center p-8">
@@ -285,7 +319,14 @@ export default function StudentVerifyAttendance() {
                     </div>
                     <div>
                         <h2 className="text-2xl font-bold text-green-600">Attendance Marked!</h2>
-                        <p className="text-muted-foreground mt-2">3 blinks verified · Face matched · GPS location recorded.</p>
+                        <p className="text-muted-foreground mt-2">Liveness verified · Face matched · GPS recorded.</p>
+                    </div>
+                    <div className="flex justify-center gap-3 flex-wrap">
+                        {Array.from(signals).map(s => (
+                            <span key={s} className="flex items-center gap-1.5 bg-green-100 text-green-700 text-xs font-semibold px-3 py-1.5 rounded-full">
+                                {SIGNAL_CONFIG[s].icon} {SIGNAL_CONFIG[s].label}
+                            </span>
+                        ))}
                     </div>
                     <Button className="w-full" onClick={() => router.push('/student')}>Back to Dashboard</Button>
                 </Card>
@@ -302,56 +343,47 @@ export default function StudentVerifyAttendance() {
                     <Button variant="ghost" className="gap-2" onClick={() => router.back()}>
                         <ArrowLeft size={16} /> Cancel
                     </Button>
-                    {/* Notification permission badge */}
                     <div className={`flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-full ${notifGranted ? 'bg-green-100 text-green-700' : 'bg-yellow-100 text-yellow-700'}`}>
-                        <Bell size={12} />
-                        {notifGranted ? 'Notifications ON' : 'Notifications OFF'}
+                        <Bell size={12} /> {notifGranted ? 'Notifications ON' : 'Notifications OFF'}
                     </div>
                 </div>
 
-                {/* ── PROXY DETECTED CARD ──────────────────────────────── */}
+                {/* Proxy detected card */}
                 {livenessState === 'photo' && (
                     <Card className="mb-6 border-2 border-red-500 shadow-xl overflow-hidden">
                         <div className="bg-red-500 text-white p-4 flex items-center gap-3">
                             <XCircle size={28} />
                             <div>
                                 <p className="font-bold text-lg">⚠️ PROXY DETECTED</p>
-                                <p className="text-sm text-red-100">Did not complete 3 blinks — photo or static face detected</p>
+                                <p className="text-sm text-red-100">No liveness signals — photo or static face</p>
                             </div>
                         </div>
                         <CardContent className="p-5">
                             {proxyStudent ? (
                                 <div className="flex items-center gap-5">
                                     <div className="shrink-0">
-                                        {proxyStudent.photoURL ? (
-                                            <img src={proxyStudent.photoURL} alt={proxyStudent.name}
-                                                className="w-20 h-20 rounded-full border-4 border-red-400 object-cover" />
-                                        ) : (
-                                            <div className="w-20 h-20 rounded-full border-4 border-red-400 bg-red-100 flex items-center justify-center">
-                                                <UserX size={36} className="text-red-400" />
-                                            </div>
-                                        )}
+                                        {proxyStudent.photoURL
+                                            ? <img src={proxyStudent.photoURL} alt={proxyStudent.name} className="w-20 h-20 rounded-full border-4 border-red-400 object-cover" />
+                                            : <div className="w-20 h-20 rounded-full border-4 border-red-400 bg-red-100 flex items-center justify-center"><UserX size={36} className="text-red-400" /></div>}
                                     </div>
                                     <div className="flex-1">
-                                        <p className="text-xl font-bold text-gray-900">{proxyStudent.name}</p>
-                                        {proxyStudent.rollNo && <p className="text-sm text-gray-500 mt-0.5">Roll No: {proxyStudent.rollNo}</p>}
+                                        <p className="text-xl font-bold">{proxyStudent.name}</p>
+                                        {proxyStudent.rollNo && <p className="text-sm text-gray-500">Roll No: {proxyStudent.rollNo}</p>}
                                         {proxyStudent.class  && <p className="text-sm text-gray-500">Class: {proxyStudent.class}</p>}
                                         {proxyStudent.email  && <p className="text-sm text-gray-500">{proxyStudent.email}</p>}
                                         <div className="mt-3 inline-flex items-center gap-2 bg-red-100 text-red-700 text-sm font-semibold px-3 py-1.5 rounded-full">
-                                            <XCircle size={14} /> Attendance NOT marked — Physical presence required!
+                                            <XCircle size={14} /> Attendance NOT marked
                                         </div>
                                     </div>
                                 </div>
                             ) : (
                                 <div className="flex items-center gap-4">
-                                    <div className="w-16 h-16 rounded-full bg-red-100 flex items-center justify-center">
-                                        <UserX size={30} className="text-red-400" />
-                                    </div>
+                                    <div className="w-16 h-16 rounded-full bg-red-100 flex items-center justify-center"><UserX size={30} className="text-red-400" /></div>
                                     <div>
-                                        <p className="font-bold text-gray-800">Unknown Person</p>
-                                        <p className="text-sm text-gray-500">Photo not matching any registered student</p>
+                                        <p className="font-bold">Unknown Person</p>
+                                        <p className="text-sm text-gray-500">Not matching any registered student</p>
                                         <div className="mt-2 inline-flex items-center gap-2 bg-red-100 text-red-700 text-sm font-semibold px-3 py-1.5 rounded-full">
-                                            <XCircle size={14} /> Attendance NOT marked!
+                                            <XCircle size={14} /> Attendance NOT marked
                                         </div>
                                     </div>
                                 </div>
@@ -360,44 +392,39 @@ export default function StudentVerifyAttendance() {
                     </Card>
                 )}
 
-                {/* ── MAIN CAMERA CARD ─────────────────────────────────── */}
+                {/* Main camera card */}
                 <Card className="shadow-xl overflow-hidden">
                     <CardHeader className="bg-primary/5 border-b">
                         <CardTitle>Verify Your Presence</CardTitle>
-                        <CardDescription>Blink 3 times · Face recognition · GPS — 100% local, no cloud</CardDescription>
+                        <CardDescription>Auto face detection · Blink / Smile / Move head · GPS</CardDescription>
                     </CardHeader>
 
-                    <CardContent className="p-0 relative bg-black aspect-video">
+                    {/* Camera + canvas overlay — NO circle, auto bounding box */}
+                    <div className="relative bg-black aspect-video overflow-hidden">
                         <video ref={videoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
+                        <canvas ref={canvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
 
-                        {/* Face circle overlay */}
-                        <div className="absolute inset-0 border-[40px] border-black/30 pointer-events-none">
-                            <div className="w-full h-full border-2 border-accent/50 rounded-2xl relative">
-                                <div className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-48 h-48 border-2 rounded-full transition-colors duration-300 ${
-                                    livenessState === 'photo' ? 'border-red-500' :
-                                    livenessState === 'real'  ? 'border-green-400' :
-                                    verifyStep === 'liveness' ? 'border-yellow-400 animate-pulse' :
-                                    'border-accent/60'
-                                }`} />
-                                <p className="absolute bottom-3 left-1/2 -translate-x-1/2 text-white/70 text-xs whitespace-nowrap bg-black/40 px-3 py-1 rounded-full">
-                                    {verifyStep === 'liveness'
-                                        ? `👁 Blink ${Math.max(0, 3 - blinkCount)} more time${3 - blinkCount !== 1 ? 's' : ''} · ${timeLeft}s`
-                                        : 'Centre your face in the circle'}
-                                </p>
+                        {/* Face not detected hint */}
+                        {verifyStep === 'liveness' && !faceDetected && (
+                            <div className="absolute inset-0 flex items-end justify-center pb-4 pointer-events-none">
+                                <span className="bg-black/60 text-white/80 text-sm px-4 py-2 rounded-full animate-pulse">
+                                    📷 Look at the camera...
+                                </span>
                             </div>
-                        </div>
+                        )}
 
-                        {/* Blink dots — always visible during liveness */}
-                        {verifyStep === 'liveness' && (
-                            <div className="absolute top-4 left-1/2 -translate-x-1/2 flex gap-3 z-20">
-                                {[1, 2, 3].map((n) => (
-                                    <div key={n} className={`w-11 h-11 rounded-full border-2 flex flex-col items-center justify-center transition-all duration-300 shadow-lg ${
-                                        blinkCount >= n
-                                            ? 'bg-green-500 border-green-300 scale-110 shadow-green-500/50'
-                                            : 'bg-black/60 border-white/30'
+                        {/* Liveness signal indicators — shown during liveness */}
+                        {verifyStep === 'liveness' && faceDetected && (
+                            <div className="absolute top-3 left-3 right-3 flex gap-2 z-20 flex-wrap">
+                                {allSignals.map(s => (
+                                    <div key={s} className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs font-semibold transition-all duration-300 ${
+                                        signals.has(s)
+                                            ? 'bg-green-500 text-white scale-105 shadow-lg shadow-green-500/40'
+                                            : 'bg-black/50 text-white/50'
                                     }`}>
-                                        <Eye size={14} className={blinkCount >= n ? 'text-white' : 'text-white/40'} />
-                                        <span className={`text-[9px] font-bold mt-0.5 ${blinkCount >= n ? 'text-white' : 'text-white/40'}`}>{n}</span>
+                                        {SIGNAL_CONFIG[s].icon}
+                                        {SIGNAL_CONFIG[s].label}
+                                        {signals.has(s) && ' ✓'}
                                     </div>
                                 ))}
                             </div>
@@ -406,10 +433,7 @@ export default function StudentVerifyAttendance() {
                         {/* Progress bar */}
                         {verifyStep === 'liveness' && (
                             <div className="absolute bottom-0 left-0 right-0 h-1.5 bg-black/40 z-10">
-                                <div
-                                    className="h-full bg-accent transition-all duration-200"
-                                    style={{ width: `${livenessProgress}%` }}
-                                />
+                                <div className="h-full bg-accent transition-all duration-300" style={{ width: `${progress}%` }} />
                             </div>
                         )}
 
@@ -418,27 +442,26 @@ export default function StudentVerifyAttendance() {
                             <div className="absolute inset-0 bg-black/75 flex flex-col items-center justify-center text-white z-10 gap-4 px-6">
                                 {verifyStep === 'liveness' ? (
                                     <>
-                                        <div className="flex gap-4 mb-1">
-                                            {[1, 2, 3].map((n) => (
-                                                <div key={n} className={`w-16 h-16 rounded-full border-2 flex flex-col items-center justify-center transition-all duration-300 ${
-                                                    blinkCount >= n
-                                                        ? 'bg-green-500 border-green-300 scale-110'
-                                                        : 'bg-white/10 border-white/30'
+                                        {/* Signal pills */}
+                                        <div className="flex gap-3 flex-wrap justify-center">
+                                            {allSignals.map(s => (
+                                                <div key={s} className={`flex items-center gap-2 px-4 py-2.5 rounded-xl border transition-all duration-300 ${
+                                                    signals.has(s)
+                                                        ? 'bg-green-500 border-green-400 scale-110 shadow-xl'
+                                                        : 'bg-white/10 border-white/20'
                                                 }`}>
-                                                    <Eye size={22} className={blinkCount >= n ? 'text-white' : 'text-white/40'} />
-                                                    <span className={`text-xs font-bold mt-0.5 ${blinkCount >= n ? 'text-white' : 'text-white/40'}`}>{n}</span>
+                                                    <span className={signals.has(s) ? 'text-white' : 'text-white/40'}>
+                                                        {SIGNAL_CONFIG[s].icon}
+                                                    </span>
+                                                    <span className={`text-sm font-semibold ${signals.has(s) ? 'text-white' : 'text-white/40'}`}>
+                                                        {SIGNAL_CONFIG[s].label}
+                                                    </span>
+                                                    {signals.has(s) && <CheckCircle2 size={14} className="text-white" />}
                                                 </div>
                                             ))}
                                         </div>
-                                        <p className="text-xl font-bold">
-                                            {blinkCount === 0 ? 'Please blink naturally...' :
-                                             blinkCount === 1 ? '1 blink ✓ — 2 more to go' :
-                                             blinkCount === 2 ? '2 blinks ✓✓ — 1 more!' :
-                                             '3 blinks ✓✓✓ — Processing...'}
-                                        </p>
-                                        <p className="text-sm text-white/60 text-center">
-                                            Keep face in circle · Blink slowly &amp; naturally · {timeLeft}s remaining
-                                        </p>
+                                        <p className="text-lg font-bold text-center">{instruction}</p>
+                                        <p className="text-sm text-white/50">{timeLeft}s · any 2 signals needed</p>
                                     </>
                                 ) : (
                                     <>
@@ -447,7 +470,6 @@ export default function StudentVerifyAttendance() {
                                     </>
                                 )}
 
-                                {/* Step dots */}
                                 <div className="flex gap-3 mt-1">
                                     {steps.map((s, i) => (
                                         <div key={s} className="flex items-center gap-2">
@@ -458,38 +480,40 @@ export default function StudentVerifyAttendance() {
                                 </div>
                             </div>
                         )}
-                    </CardContent>
+                    </div>
 
                     <div className="p-6 border-t flex flex-col gap-4">
                         {/* Feature badges */}
                         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                             <div className="flex items-center gap-2 text-xs text-muted-foreground bg-muted p-3 rounded-lg">
-                                <Eye className="text-green-500 shrink-0" size={14} /><p>3-Blink check</p>
+                                <Eye className="text-green-500 shrink-0" size={14} /><p>Blink detect</p>
+                            </div>
+                            <div className="flex items-center gap-2 text-xs text-muted-foreground bg-muted p-3 rounded-lg">
+                                <Smile className="text-yellow-500 shrink-0" size={14} /><p>Smile detect</p>
                             </div>
                             <div className="flex items-center gap-2 text-xs text-muted-foreground bg-muted p-3 rounded-lg">
                                 <Brain className="text-primary shrink-0" size={14} /><p>Local AI</p>
-                            </div>
-                            <div className="flex items-center gap-2 text-xs text-muted-foreground bg-muted p-3 rounded-lg">
-                                <ShieldCheck className="text-accent shrink-0" size={14} /><p>128-d face match</p>
                             </div>
                             <div className="flex items-center gap-2 text-xs text-muted-foreground bg-muted p-3 rounded-lg">
                                 <MapPin className="text-primary shrink-0" size={14} /><p>GPS recorded</p>
                             </div>
                         </div>
 
-                        {/* Instruction banner */}
+                        {/* Instructions */}
                         <div className="flex items-start gap-2 bg-blue-50 border border-blue-200 rounded-lg p-3 text-xs text-blue-800">
-                            <Eye size={14} className="shrink-0 mt-0.5 text-blue-500" />
+                            <ShieldCheck size={14} className="shrink-0 mt-0.5 text-blue-500" />
                             <p>
-                                <strong>How it works:</strong> You must blink <strong>3 times</strong> within 5 seconds.
-                                Each blink lights up a circle ✓. Photos and static faces are automatically rejected.
-                                Make sure your face is well-lit and centred in the circle.
+                                <strong>Auto detection:</strong> Just look at the camera. 
+                                The system automatically detects your face and asks you to perform 
+                                any <strong>2 of 4</strong> actions: <strong>blink</strong>, <strong>smile</strong>, 
+                                <strong> turn head</strong>, or <strong>nod</strong>.
+                                Photos and static faces are rejected instantly.
                             </p>
                         </div>
 
                         <div className="flex items-start gap-2 bg-yellow-50 border border-yellow-200 rounded-lg p-3 text-xs text-yellow-800">
                             <AlertTriangle size={14} className="shrink-0 mt-0.5" />
-                            <p>Ensure good lighting · Blink slowly and naturally · First-time AI model download ~10 sec.</p>
+                            <p>Good lighting required · Face must be clearly visible · First-time model download ~10 sec</p>
                         </div>
 
                         <Button

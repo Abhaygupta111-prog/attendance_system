@@ -86,7 +86,7 @@ export default function LoginPage() {
                   id="password" 
                   type="password" 
                   placeholder="••••••••" 
-                  defaultValue="password"
+                  
                   required
                   className="h-11"
                 />
